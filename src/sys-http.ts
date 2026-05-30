@@ -1,0 +1,225 @@
+/**
+ * `sys:http` — privileged HTTP-over-IPC bridge.
+ *
+ * The webview's `fetch` / `EventSource` polyfills dispatch through this
+ * pseudo-tool so same-origin /api/* requests never leave the IPC channel.
+ * That removes the webview's HTTP-pool-per-host pressure entirely (the
+ * connection-pool exhaustion that hangs the live agent-thinking popover
+ * on the harness page; see host-architecture-2026-05-20-v2.md Phase 1).
+ *
+ * Wire shape over the existing IPC protocol:
+ *
+ *   REQUEST  { id, toolName: 'sys:http',
+ *              input: { method, path, headers?, body? } }
+ *   ─►  fetch <upstream-base><path> with forwarded method/headers/body
+ *
+ *   EVENT_JSON { id, name: 'head', data: { status, headers } }
+ *     Always first, before any body chunk.
+ *
+ *   For `text/event-stream` responses:
+ *     EVENT_JSON { id, name: 'sse-chunk', data: <raw SSE wire bytes as UTF-8> }
+ *       Repeated. The client polyfill feeds these to a standard SSE
+ *       line parser. No DONE until the upstream stream ends (or CANCEL).
+ *
+ *   For non-SSE responses:
+ *     EVENT_BIN  [id][nameLen][name='body'][raw bytes]
+ *       Repeated; chunked under the 16-MiB frame cap.
+ *     DONE { id, result: { content: [] } } when the body ends.
+ *
+ *   ERROR { id, error: { code, message } } on bad input / aborted /
+ *     upstream failure. Terminal.
+ *
+ * The upstream target is the operator's own loopback HTTP port — the
+ * Next sidecar today. This is *not* HTTP from the webview's perspective
+ * (the webview only ever speaks IPC); it's a Node→Node loopback hop
+ * that sidesteps the browser's per-host connection pool entirely.
+ */
+
+import { FrameType, encodeEventBinPayload, type FrameTypeValue } from '@papercusp/ipc-framing';
+
+// RFC 7230 hop-by-hop headers + h2 forbidden headers — must not be
+// forwarded across the bridge in either direction.
+const HOP_BY_HOP = new Set([
+  'connection',
+  'keep-alive',
+  'transfer-encoding',
+  'upgrade',
+  'te',
+  'trailers',
+  'proxy-authenticate',
+  'proxy-authorization',
+]);
+
+// Largest EVENT_BIN body chunk we emit; well under the 16-MiB frame cap
+// to leave room for the id/name prefix in the frame payload.
+const MAX_BODY_CHUNK_BYTES = 15 * 1024 * 1024;
+
+export interface SysHttpDeps {
+  writeFrame: (type: FrameTypeValue, payload: Buffer) => boolean;
+  writeJson: (type: FrameTypeValue, value: unknown) => boolean;
+  logger: { info: (msg: string) => void; warn: (msg: string) => void };
+  /** Override the upstream base for tests; in prod resolved from env. */
+  upstreamBase?: string;
+  /** Override fetch for tests. */
+  fetchImpl?: typeof fetch;
+}
+
+function resolveUpstreamBase(override?: string): string {
+  if (override) return override;
+  if (process.env.PAPERCUSP_OPERATOR_BASE) return process.env.PAPERCUSP_OPERATOR_BASE;
+  const port = process.env.PORT || '3055';
+  return `http://127.0.0.1:${port}`;
+}
+
+export async function handleSysHttp(
+  id: bigint,
+  input: unknown,
+  signal: AbortSignal,
+  deps: SysHttpDeps,
+): Promise<void> {
+  const { writeFrame, writeJson, logger } = deps;
+  const fetchImpl = deps.fetchImpl ?? fetch;
+
+  // Input validation. Reject anything that isn't a same-origin relative
+  // path — the bridge is not an open proxy.
+  if (!input || typeof input !== 'object') {
+    writeJson(FrameType.ERROR, {
+      id: Number(id),
+      error: { code: 'bad_input', message: 'sys:http input must be an object' },
+    });
+    return;
+  }
+  const { method, path, headers: inHeaders, body } = input as {
+    method?: unknown;
+    path?: unknown;
+    headers?: unknown;
+    body?: unknown;
+  };
+  if (typeof method !== 'string' || typeof path !== 'string') {
+    writeJson(FrameType.ERROR, {
+      id: Number(id),
+      error: { code: 'bad_input', message: 'sys:http requires { method, path }' },
+    });
+    return;
+  }
+  if (!path.startsWith('/') || path.includes('://') || path.includes('/../')) {
+    writeJson(FrameType.ERROR, {
+      id: Number(id),
+      error: {
+        code: 'bad_path',
+        message: 'sys:http path must be a relative path without traversal',
+      },
+    });
+    return;
+  }
+
+  const upstreamUrl = resolveUpstreamBase(deps.upstreamBase) + path;
+
+  const upstreamHeaders: Record<string, string> = {};
+  if (inHeaders && typeof inHeaders === 'object') {
+    for (const [k, v] of Object.entries(inHeaders as Record<string, unknown>)) {
+      if (typeof v === 'string' && !HOP_BY_HOP.has(k.toLowerCase())) {
+        upstreamHeaders[k] = v;
+      }
+    }
+  }
+
+  let res: Response;
+  try {
+    res = await fetchImpl(upstreamUrl, {
+      method,
+      headers: upstreamHeaders,
+      body: typeof body === 'string' ? body : undefined,
+      signal,
+    });
+  } catch (err) {
+    if (signal.aborted) {
+      writeJson(FrameType.ERROR, {
+        id: Number(id),
+        error: { code: 'aborted', message: 'request aborted' },
+      });
+    } else {
+      writeJson(FrameType.ERROR, {
+        id: Number(id),
+        error: {
+          code: 'upstream_error',
+          message: err instanceof Error ? err.message : String(err),
+        },
+      });
+    }
+    return;
+  }
+
+  const contentType = res.headers.get('content-type') ?? '';
+  const responseHeaders: Record<string, string> = {};
+  res.headers.forEach((v, k) => {
+    if (!HOP_BY_HOP.has(k.toLowerCase())) responseHeaders[k] = v;
+  });
+
+  writeJson(FrameType.EVENT_JSON, {
+    id: Number(id),
+    name: 'head',
+    data: { status: res.status, headers: responseHeaders },
+  });
+
+  if (!res.body) {
+    writeJson(FrameType.DONE, { id: Number(id), result: { content: [] } });
+    return;
+  }
+
+  const isSse = contentType.toLowerCase().includes('text/event-stream');
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+
+  try {
+    while (true) {
+      if (signal.aborted) break;
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value || value.length === 0) continue;
+      if (isSse) {
+        writeJson(FrameType.EVENT_JSON, {
+          id: Number(id),
+          name: 'sse-chunk',
+          data: decoder.decode(value, { stream: true }),
+        });
+      } else {
+        let offset = 0;
+        while (offset < value.length) {
+          if (signal.aborted) break;
+          const end = Math.min(offset + MAX_BODY_CHUNK_BYTES, value.length);
+          const slice = value.subarray(offset, end);
+          writeFrame(FrameType.EVENT_BIN, encodeEventBinPayload(id, 'body', slice));
+          offset = end;
+        }
+      }
+    }
+  } catch (err) {
+    if (!signal.aborted) {
+      logger.warn(`sys:http stream error: ${err instanceof Error ? err.message : String(err)}`);
+      writeJson(FrameType.ERROR, {
+        id: Number(id),
+        error: {
+          code: 'stream_error',
+          message: err instanceof Error ? err.message : String(err),
+        },
+      });
+      return;
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      /* already released */
+    }
+  }
+
+  if (signal.aborted) {
+    writeJson(FrameType.ERROR, {
+      id: Number(id),
+      error: { code: 'aborted', message: 'request aborted' },
+    });
+  } else {
+    writeJson(FrameType.DONE, { id: Number(id), result: { content: [] } });
+  }
+}
