@@ -66,7 +66,9 @@ export interface SysHttpDeps {
 
 function resolveUpstreamBase(override?: string): string {
   if (override) return override;
-  if (process.env.PAPERCUSP_OPERATOR_BASE) return process.env.PAPERCUSP_OPERATOR_BASE;
+  // Generic, unbranded env fallback. The host normally injects
+  // `upstreamBaseUrl` (mapped from its own env) via the server options.
+  if (process.env.IPC_UPSTREAM_BASE) return process.env.IPC_UPSTREAM_BASE;
   const port = process.env.PORT || '3055';
   return `http://127.0.0.1:${port}`;
 }
@@ -192,6 +194,16 @@ export async function handleSysHttp(
           writeFrame(FrameType.EVENT_BIN, encodeEventBinPayload(id, 'body', slice));
           offset = end;
         }
+      }
+    }
+    // Flush any bytes the streaming TextDecoder buffered mid-multibyte-UTF-8
+    // sequence at end-of-stream (e.g. truncated upstream). decode() with no
+    // args finalizes the decoder; emit the remainder so SSE text isn't
+    // silently dropped.
+    if (isSse && !signal.aborted) {
+      const tail = decoder.decode();
+      if (tail) {
+        writeJson(FrameType.EVENT_JSON, { id: Number(id), name: 'sse-chunk', data: tail });
       }
     }
   } catch (err) {

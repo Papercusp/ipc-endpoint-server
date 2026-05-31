@@ -6,8 +6,9 @@
  * Lifecycle:
  *   1. Caller invokes `startEndpointIpcServer({ socketPath, host })`.
  *   2. Server binds, unlinks any stale socket, prints the
- *      `PAPERCUSP_IPC_READY socket=<path>` line to stdout.
- *   3. Rust client connects, sends REQUEST frames, receives EVENT_JSON /
+ *      `<readyToken> socket=<path>` line to stdout (default token
+ *      `IPC_READY`; the host sets it to whatever its client expects).
+ *   3. The client connects, sends REQUEST frames, receives EVENT_JSON /
  *      EVENT_BIN / DONE / ERROR frames, may send CANCEL.
  *   4. On process exit, server unlinks the socket file.
  *
@@ -74,12 +75,16 @@ export interface IpcEndpointHost {
   getWorkspaceId(): string;
 }
 
-/** Returns the default per-process socket path on this OS. */
+/**
+ * Returns the default per-process socket path on this OS. Neutral,
+ * unbranded fallback — hosts that want a specific location (e.g. under a
+ * project config dir) pass an explicit `socketPath` instead.
+ */
 export function defaultSocketPath(pid: number = process.pid): string {
   if (process.platform === 'win32') {
-    return `\\\\.\\pipe\\papercusp-${pid}`;
+    return `\\\\.\\pipe\\ipc-endpoint-server-${pid}`;
   }
-  return path.join(os.homedir(), '.papercusp', 'sockets', `${pid}.sock`);
+  return path.join(os.tmpdir(), 'ipc-endpoint-server', `${pid}.sock`);
 }
 
 export interface StartEndpointIpcServerOptions {
@@ -88,8 +93,21 @@ export interface StartEndpointIpcServerOptions {
    * id. Required: without it the server can't run any tool.
    */
   host: IpcEndpointHost;
-  /** Override default `~/.papercusp/sockets/<pid>.sock` / named-pipe path. */
+  /** Override the default OS socket / named-pipe path (see `defaultSocketPath`). */
   socketPath?: string;
+  /**
+   * Token prefix for the stdout handshake line, printed as
+   * `<readyToken> socket=<path>` once the server is bound. A spawning
+   * parent watches stdout for this exact prefix. Default `'IPC_READY'`;
+   * the host sets it to whatever its client expects.
+   */
+  readyToken?: string;
+  /**
+   * Upstream base URL for the `sys:http` bridge — relative `/api/*` calls
+   * a tool makes are proxied here. When unset, falls back to the generic
+   * `IPC_UPSTREAM_BASE` env var, then `http://127.0.0.1:${PORT||3055}`.
+   */
+  upstreamBaseUrl?: string;
   /**
    * Allowed tool names. When unset, every registered projected tool is
    * dispatchable; when set, REQUESTs for other tool names return an
@@ -130,6 +148,8 @@ export async function startEndpointIpcServer(
 ): Promise<EndpointIpcServer> {
   const host = options.host;
   const socketPath = options.socketPath ?? defaultSocketPath();
+  const readyToken = options.readyToken ?? 'IPC_READY';
+  const upstreamBase = options.upstreamBaseUrl;
   const allowed =
     options.allowedTools !== undefined
       ? new Set(options.allowedTools)
@@ -157,7 +177,7 @@ export async function startEndpointIpcServer(
   const connections = new Set<net.Socket>();
   const server = net.createServer((socket) => {
     connections.add(socket);
-    handleConnection(socket, { allowed, deps, logger, host });
+    handleConnection(socket, { allowed, deps, logger, host, upstreamBase });
     socket.on('close', () => {
       connections.delete(socket);
     });
@@ -179,8 +199,9 @@ export async function startEndpointIpcServer(
     });
   });
 
-  // Stdout-ready-line per PROTOCOL.md. Rust waits on this exact prefix.
-  process.stdout.write(`PAPERCUSP_IPC_READY socket=${socketPath}\n`);
+  // Stdout-ready-line per PROTOCOL.md. The spawning client waits on this
+  // exact prefix (the host sets it via `readyToken`).
+  process.stdout.write(`${readyToken} socket=${socketPath}\n`);
 
   return {
     server,
@@ -208,6 +229,8 @@ interface PerConnectionDeps {
   deps: DispatchProjectedDeps;
   logger: { info: (msg: string) => void; warn: (msg: string) => void };
   host: IpcEndpointHost;
+  /** Upstream base for the sys:http bridge; undefined → resolved from env. */
+  upstreamBase?: string;
 }
 
 function handleConnection(socket: net.Socket, deps: PerConnectionDeps): void {
@@ -329,6 +352,7 @@ function handleConnection(socket: net.Socket, deps: PerConnectionDeps): void {
         writeFrame,
         writeJson,
         logger: deps.logger,
+        upstreamBase: deps.upstreamBase,
       })
         .catch((err) =>
           sendError(id, 'sys_http_error', err instanceof Error ? err.message : String(err)),

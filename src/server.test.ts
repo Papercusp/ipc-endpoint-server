@@ -174,7 +174,7 @@ beforeEach(async () => {
 });
 
 describe('startEndpointIpcServer', () => {
-  it('binds and prints PAPERCUSP_IPC_READY (verified by socket existing)', () => {
+  it('binds and prints the ready line (verified by socket existing)', () => {
     if (process.platform !== 'win32') {
       expect(fs.existsSync(socketPath)).toBe(true);
     }
