@@ -169,6 +169,55 @@ describe('handleSysHttp — JSON GET (non-SSE)', () => {
   });
 });
 
+describe('handleSysHttp — host-injected headers (in-boundary credential)', () => {
+  it('injects host headers upstream, overriding a forwarded same-name header', async () => {
+    const seen: { headers?: Headers } = {};
+    const { deps } = makeDeps(async (_url, init) => {
+      seen.headers = new Headers(init?.headers as HeadersInit);
+      return jsonResponse({ ok: true });
+    });
+    // The host supplies the in-boundary credential; a webview-forwarded
+    // `authorization` must NOT be able to shadow it.
+    deps.injectHeaders = () => ({ authorization: 'Bearer host-token', 'x-extra': '1' });
+
+    await handleSysHttp(
+      1n,
+      {
+        method: 'GET',
+        path: '/api/admin/plans/get',
+        headers: { authorization: 'Bearer webview-supplied' },
+      },
+      new AbortController().signal,
+      deps,
+    );
+
+    expect(seen.headers!.get('authorization')).toBe('Bearer host-token');
+    expect(seen.headers!.get('x-extra')).toBe('1');
+  });
+
+  it('drops hop-by-hop names from injected headers and tolerates an undefined return', async () => {
+    const seen: { headers?: Headers } = {};
+    const { deps } = makeDeps(async (_url, init) => {
+      seen.headers = new Headers(init?.headers as HeadersInit);
+      return jsonResponse({ ok: true });
+    });
+    deps.injectHeaders = () => ({ authorization: 'Bearer t', connection: 'close' });
+    await handleSysHttp(1n, { method: 'GET', path: '/api/x' }, new AbortController().signal, deps);
+    expect(seen.headers!.get('authorization')).toBe('Bearer t');
+    expect(seen.headers!.get('connection')).toBeNull();
+
+    // A thunk that returns undefined → no injection, no throw.
+    const seen2: { headers?: Headers } = {};
+    const { deps: deps2 } = makeDeps(async (_url, init) => {
+      seen2.headers = new Headers(init?.headers as HeadersInit);
+      return jsonResponse({ ok: true });
+    });
+    deps2.injectHeaders = () => undefined;
+    await handleSysHttp(1n, { method: 'GET', path: '/api/y' }, new AbortController().signal, deps2);
+    expect(seen2.headers!.get('authorization')).toBeNull();
+  });
+});
+
 describe('handleSysHttp — SSE streaming', () => {
   it('emits head then sse-chunk events with raw wire text, then DONE on stream end', async () => {
     const { deps, emitted } = makeDeps(async () =>

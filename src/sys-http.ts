@@ -62,6 +62,19 @@ export interface SysHttpDeps {
   upstreamBase?: string;
   /** Override fetch for tests. */
   fetchImpl?: typeof fetch;
+  /**
+   * Headers the host injects into every bridged upstream request — e.g. an
+   * in-boundary auth credential. The webview is in-boundary (same process
+   * tree as the trusted shell), but its HttpOnly session cookie cannot ride
+   * the IPC bridge: JS can neither read it to forward nor honor the
+   * Set-Cookie that comes back. So a host that gates `/api/*` on a session
+   * supplies the equivalent trusted credential here. Resolved per request
+   * so the host can return a freshly-read (rotatable) token. Merged OVER the
+   * forwarded headers (host wins, so a webview header can't shadow the
+   * credential); hop-by-hop names are still dropped. The package itself
+   * never reads any credential — it stays domain-free.
+   */
+  injectHeaders?: () => Record<string, string> | undefined;
 }
 
 function resolveUpstreamBase(override?: string): string {
@@ -120,6 +133,17 @@ export async function handleSysHttp(
   const upstreamHeaders: Record<string, string> = {};
   if (inHeaders && typeof inHeaders === 'object') {
     for (const [k, v] of Object.entries(inHeaders as Record<string, unknown>)) {
+      if (typeof v === 'string' && !HOP_BY_HOP.has(k.toLowerCase())) {
+        upstreamHeaders[k] = v;
+      }
+    }
+  }
+  // Host-injected credential (e.g. the in-boundary trusted bearer). Merged
+  // last so it wins over any same-named webview-forwarded header; hop-by-hop
+  // names are still dropped.
+  const injected = deps.injectHeaders?.();
+  if (injected) {
+    for (const [k, v] of Object.entries(injected)) {
       if (typeof v === 'string' && !HOP_BY_HOP.has(k.toLowerCase())) {
         upstreamHeaders[k] = v;
       }

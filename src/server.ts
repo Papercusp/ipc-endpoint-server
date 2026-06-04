@@ -124,6 +124,15 @@ export interface StartEndpointIpcServerOptions {
    * Optional logger. Defaults to console.log/warn with an [ipc] prefix.
    */
   logger?: { info: (msg: string) => void; warn: (msg: string) => void };
+  /**
+   * Headers the host injects into every `sys:http` bridged upstream request.
+   * The webview is in-boundary but its HttpOnly session cookie can't ride the
+   * IPC bridge, so a host that gates `/api/*` on a session supplies the
+   * equivalent trusted credential here (resolved per request for rotation).
+   * See `SysHttpDeps.injectHeaders`. The package never reads any credential
+   * itself — this stays domain-free.
+   */
+  sysHttpInjectHeaders?: () => Record<string, string> | undefined;
 }
 
 export interface EndpointIpcServer {
@@ -150,6 +159,7 @@ export async function startEndpointIpcServer(
   const socketPath = options.socketPath ?? defaultSocketPath();
   const readyToken = options.readyToken ?? 'IPC_READY';
   const upstreamBase = options.upstreamBaseUrl;
+  const sysHttpInjectHeaders = options.sysHttpInjectHeaders;
   const allowed =
     options.allowedTools !== undefined
       ? new Set(options.allowedTools)
@@ -177,7 +187,7 @@ export async function startEndpointIpcServer(
   const connections = new Set<net.Socket>();
   const server = net.createServer((socket) => {
     connections.add(socket);
-    handleConnection(socket, { allowed, deps, logger, host, upstreamBase });
+    handleConnection(socket, { allowed, deps, logger, host, upstreamBase, sysHttpInjectHeaders });
     socket.on('close', () => {
       connections.delete(socket);
     });
@@ -231,6 +241,8 @@ interface PerConnectionDeps {
   host: IpcEndpointHost;
   /** Upstream base for the sys:http bridge; undefined → resolved from env. */
   upstreamBase?: string;
+  /** Host credential injected into sys:http upstream requests; see options. */
+  sysHttpInjectHeaders?: () => Record<string, string> | undefined;
 }
 
 function handleConnection(socket: net.Socket, deps: PerConnectionDeps): void {
@@ -353,6 +365,7 @@ function handleConnection(socket: net.Socket, deps: PerConnectionDeps): void {
         writeJson,
         logger: deps.logger,
         upstreamBase: deps.upstreamBase,
+        injectHeaders: deps.sysHttpInjectHeaders,
       })
         .catch((err) =>
           sendError(id, 'sys_http_error', err instanceof Error ? err.message : String(err)),
