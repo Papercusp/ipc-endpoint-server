@@ -273,3 +273,72 @@ describe('handleSysHttp — abort + upstream errors', () => {
     expect((err!.payload as any).error.message).toMatch(/econnrefused/);
   });
 });
+
+describe('handleSysHttp — mid-stream termination', () => {
+  // A ReadableStream that FLOWS `chunks` (one per pull), then errors the
+  // controller (mimics undici's `TypeError: terminated` when an upstream closes
+  // the socket mid-stream). Pull-based so the chunk is delivered to the reader
+  // BEFORE the error — a synchronous enqueue-then-error in `start` discards the
+  // queue (the stream errors before any read() drains it).
+  function streamThatErrors(contentType: string, chunks: string[], errMsg: string): Response {
+    let i = 0;
+    const enc = new TextEncoder();
+    const stream = new ReadableStream({
+      pull(controller) {
+        if (i < chunks.length) controller.enqueue(enc.encode(chunks[i++]));
+        else controller.error(new TypeError(errMsg));
+      },
+    });
+    return new Response(stream, { status: 200, headers: { 'content-type': contentType } });
+  }
+
+  function withCapturingLogger(fetchImpl: typeof fetch) {
+    const made = makeDeps(fetchImpl);
+    const infos: string[] = [];
+    const warns: string[] = [];
+    made.deps.logger = { info: (m) => infos.push(m), warn: (m) => warns.push(m) };
+    return { ...made, infos, warns };
+  }
+
+  it('treats an SSE upstream close as a GRACEFUL DONE (no ERROR, info-logged with route)', async () => {
+    const { deps, emitted, infos, warns } = withCapturingLogger(async () =>
+      streamThatErrors('text/event-stream', ['event: foo\ndata: 1\n\n'], 'terminated'),
+    );
+
+    await handleSysHttp(5n, { method: 'GET', path: '/api/stream' }, new AbortController().signal, deps);
+
+    // The flowed chunk still made it through before the close.
+    const chunks = emitted.filter(
+      (e) => e.type === FrameType.EVENT_JSON && (e.payload as any).name === 'sse-chunk',
+    );
+    expect(chunks).toHaveLength(1);
+
+    // Terminal frame is a graceful DONE — NOT a stream_error ERROR. (Client-side
+    // identical: IpcEventSource reconnects on both — but no false "error".)
+    const last = emitted[emitted.length - 1];
+    expect(last.type).toBe(FrameType.DONE);
+    expect(emitted.find((e) => e.type === FrameType.ERROR)).toBeUndefined();
+
+    // Logged at info WITH context (method + path + the close reason), not warn.
+    expect(warns).toHaveLength(0);
+    expect(infos.some((m) => /SSE upstream closed/.test(m) && m.includes('GET /api/stream') && /terminated/.test(m))).toBe(true);
+  });
+
+  it('keeps a NON-SSE mid-stream truncation a hard ERROR{code:stream_error} (warn-logged with route)', async () => {
+    const { deps, emitted, infos, warns } = withCapturingLogger(async () =>
+      streamThatErrors('application/octet-stream', ['partial'], 'terminated'),
+    );
+
+    await handleSysHttp(6n, { method: 'GET', path: '/api/blob' }, new AbortController().signal, deps);
+
+    const err = emitted.find((e) => e.type === FrameType.ERROR);
+    expect(err).toBeDefined();
+    expect((err!.payload as any).error.code).toBe('stream_error');
+    expect((err!.payload as any).error.message).toMatch(/terminated/);
+    // No graceful DONE for a truncated non-SSE body.
+    expect(emitted.find((e) => e.type === FrameType.DONE)).toBeUndefined();
+    // Logged at warn WITH context; not info.
+    expect(infos).toHaveLength(0);
+    expect(warns.some((m) => /stream error/.test(m) && m.includes('GET /api/blob'))).toBe(true);
+  });
+});

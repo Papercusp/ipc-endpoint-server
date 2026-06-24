@@ -232,15 +232,35 @@ export async function handleSysHttp(
     }
   } catch (err) {
     if (!signal.aborted) {
-      logger.warn(`sys:http stream error: ${err instanceof Error ? err.message : String(err)}`);
-      writeJson(FrameType.ERROR, {
-        id: Number(id),
-        error: {
-          code: 'stream_error',
-          message: err instanceof Error ? err.message : String(err),
-        },
-      });
-      return;
+      const message = err instanceof Error ? err.message : String(err);
+      if (isSse) {
+        // An SSE stream has no in-band "end" frame — the server signals
+        // end-of-stream by simply CLOSING the socket, which surfaces here as
+        // undici's `terminated` (or a comparable connection-reset) on the next
+        // read. That is the NORMAL lifecycle of a long-lived SSE upstream
+        // (operator restart, keep-alive/idle rotation, a deliberate recycle),
+        // not a fault. The IpcEventSource client treats a graceful DONE and a
+        // `stream_error` ERROR IDENTICALLY — both → reconnect with Last-Event-ID
+        // (see ipc-event-source.ts runOnce: `done` → 'drop', non-IPC-unavailable
+        // `error` → 'drop') — so emitting the DONE below is behaviorally
+        // identical client-side while no longer mischaracterizing a routine drop
+        // as a WARN-level "error". Log at info WITH request context (method+path)
+        // so the genuinely-rare case where it matters is diagnosable: the bare
+        // `sys:http stream error: terminated` named neither the stream nor the
+        // route, making the recurring bg-host warnings un-triageable.
+        logger.info(`sys:http SSE upstream closed (${method} ${path}): ${message}`);
+        // Fall through to the graceful DONE emitted after the finally block.
+      } else {
+        // A NON-SSE body that terminates mid-stream IS a real truncation the
+        // client must see (a partial JSON/binary response), so it stays a hard
+        // error — now with request context so it can actually be diagnosed.
+        logger.warn(`sys:http stream error (${method} ${path}): ${message}`);
+        writeJson(FrameType.ERROR, {
+          id: Number(id),
+          error: { code: 'stream_error', message },
+        });
+        return;
+      }
     }
   } finally {
     try {
