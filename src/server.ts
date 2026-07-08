@@ -87,6 +87,45 @@ export function defaultSocketPath(pid: number = process.pid): string {
   return path.join(os.tmpdir(), 'ipc-endpoint-server', `${pid}.sock`);
 }
 
+/**
+ * The three transports `net.Server` can bind, discriminated from the
+ * `socketPath` string. `net.Server` speaks all three identically at the
+ * byte level, so the wire framing is transport-agnostic — only the
+ * `listen()` argument, the filesystem prep, and the reported endpoint
+ * differ.
+ *
+ * - `unix`  — a filesystem path → a Unix domain socket (mac/Linux).
+ * - `pipe`  — a `\\.\pipe\…` path → a Windows named pipe.
+ * - `tcp`   — a `tcp://host:port` URL → a loopback TCP listener. This is
+ *   the WSL2 case: the Windows desktop runs the sidecar INSIDE WSL2
+ *   (`process.platform==='linux'`), where a Unix socket is unreachable by
+ *   the Windows-native webview host and a named pipe can't be created;
+ *   WSL2's localhost-forwarding makes `127.0.0.1:<port>` reachable from
+ *   the Windows host, so TCP loopback is the transport that carries the
+ *   IPC bypass across the WSL boundary. Port `0` binds an ephemeral port;
+ *   the resolved port is reported back in the ready line / discovery.
+ */
+export type ResolvedEndpoint =
+  | { kind: 'unix'; path: string }
+  | { kind: 'pipe'; path: string }
+  | { kind: 'tcp'; host: string; port: number };
+
+/** Classify a `socketPath` string into its transport. Exported for tests + the Rust-side guard parity. */
+export function parseEndpoint(socketPath: string): ResolvedEndpoint {
+  const trimmed = socketPath.trim();
+  const tcp = /^tcp:\/\/(\[[^\]]+\]|[^/:]+):(\d+)$/.exec(trimmed);
+  if (tcp) {
+    // Strip [] from a bracketed IPv6 literal for node's listen({ host }).
+    const host = tcp[1].startsWith('[') ? tcp[1].slice(1, -1) : tcp[1];
+    return { kind: 'tcp', host, port: Number(tcp[2]) };
+  }
+  const lower = trimmed.toLowerCase();
+  if (lower.startsWith('\\\\.\\pipe\\') || lower.startsWith('\\\\?\\pipe\\')) {
+    return { kind: 'pipe', path: socketPath };
+  }
+  return { kind: 'unix', path: socketPath };
+}
+
 export interface StartEndpointIpcServerOptions {
   /**
    * Host seam — resolve/dispatch projected tools + the active workspace
@@ -171,7 +210,13 @@ export async function startEndpointIpcServer(
       warn: (m) => console.warn(`[ipc] ${m}`),
     };
 
-  if (process.platform !== 'win32') {
+  const endpoint = parseEndpoint(socketPath);
+
+  // Filesystem prep is Unix-socket-only. Gating on the endpoint kind (not
+  // `process.platform`) is load-bearing for the TCP case: inside WSL2 the
+  // platform is `linux`, so a platform check would wrongly try to
+  // mkdir/unlink the `tcp://…` string as if it were a socket file path.
+  if (endpoint.kind === 'unix') {
     await fs.promises.mkdir(path.dirname(socketPath), {
       recursive: true,
       mode: 0o700,
@@ -203,25 +248,41 @@ export async function startEndpointIpcServer(
       reject(err);
     };
     server.once('error', onError);
-    server.listen(socketPath, () => {
+    const onListening = (): void => {
       server.off('error', onError);
       resolve();
-    });
+    };
+    if (endpoint.kind === 'tcp') {
+      server.listen({ host: endpoint.host, port: endpoint.port }, onListening);
+    } else {
+      server.listen(socketPath, onListening);
+    }
   });
+
+  // For TCP the bound port may be ephemeral (port 0), so report the ACTUAL
+  // port the OS assigned — that's the value the client discovers and dials.
+  // Unix/pipe endpoints report the path unchanged.
+  let resolvedSocketPath = socketPath;
+  if (endpoint.kind === 'tcp') {
+    const addr = server.address();
+    const boundPort =
+      addr && typeof addr === 'object' ? addr.port : endpoint.port;
+    resolvedSocketPath = `tcp://${endpoint.host}:${boundPort}`;
+  }
 
   // Stdout-ready-line per PROTOCOL.md. The spawning client waits on this
   // exact prefix (the host sets it via `readyToken`).
-  process.stdout.write(`${readyToken} socket=${socketPath}\n`);
+  process.stdout.write(`${readyToken} socket=${resolvedSocketPath}\n`);
 
   return {
     server,
-    socketPath,
+    socketPath: resolvedSocketPath,
     connectionCount: () => connections.size,
     close: async () => {
       for (const c of connections) c.destroy();
       connections.clear();
       await new Promise<void>((resolve) => server.close(() => resolve()));
-      if (process.platform !== 'win32') {
+      if (endpoint.kind === 'unix') {
         try {
           await fs.promises.unlink(socketPath);
         } catch {
