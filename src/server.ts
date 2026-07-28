@@ -181,6 +181,19 @@ export interface EndpointIpcServer {
   socketPath: string;
   /** Number of currently-open client connections. */
   connectionCount(): number;
+  /**
+   * Monotonic count of connections accepted over this server's whole lifetime.
+   *
+   * The ENGAGEMENT probe: `connectionCount()` answers "is a client attached
+   * right now", which is 0 in several perfectly healthy states, so it cannot
+   * support the question that actually matters — "is this bridge carrying
+   * anything at all, or is it installed and connected to nothing?". A zero here
+   * after the server has been listening a while means nothing has ever dialled
+   * it. Pair it with evidence that a client EXISTS and is reaching the host
+   * another way (see the operator's engagement collector) to tell "no client"
+   * apart from "client bypassing this bridge".
+   */
+  acceptedTotal(): number;
   /** Close listener + all open connections; resolves when fully shut down. */
   close(): Promise<void>;
 }
@@ -230,8 +243,16 @@ export async function startEndpointIpcServer(
   }
 
   const connections = new Set<net.Socket>();
+  // Monotonic lifetime count of accepted connections. Deliberately NOT derived
+  // from `connections.size`: that is instantaneous, and 0-right-now is a
+  // legitimate state (between reconnects, or before the client boots). Only a
+  // lifetime counter can distinguish "idle at this instant" from "nothing has
+  // EVER dialled this socket" — the latter being the signature of an IPC bridge
+  // that is installed and carrying nothing (WI-6512).
+  let acceptedTotal = 0;
   const server = net.createServer((socket) => {
     connections.add(socket);
+    acceptedTotal += 1;
     handleConnection(socket, { allowed, deps, logger, host, upstreamBase, sysHttpInjectHeaders });
     socket.on('close', () => {
       connections.delete(socket);
@@ -278,6 +299,7 @@ export async function startEndpointIpcServer(
     server,
     socketPath: resolvedSocketPath,
     connectionCount: () => connections.size,
+    acceptedTotal: () => acceptedTotal,
     close: async () => {
       for (const c of connections) c.destroy();
       connections.clear();
