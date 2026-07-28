@@ -181,6 +181,27 @@ describe('startEndpointIpcServer', () => {
     expect(server.socketPath).toBe(socketPath);
   });
 
+  it('acceptedTotal counts connections for the server lifetime, and does not fall back when they close', async () => {
+    // The ENGAGEMENT probe. `connectionCount()` is a live gauge, so it cannot
+    // distinguish "idle between reconnects" from "nothing has EVER dialled this
+    // socket" — and only the latter is evidence of a bridge that is installed
+    // and carrying nothing (WI-6512). That is what this monotonic counter is
+    // for, so the property under test is specifically that it does NOT decrease.
+    const before = server.acceptedTotal();
+
+    const a = await connect(socketPath);
+    const b = await connect(socketPath);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(server.acceptedTotal()).toBe(before + 2);
+    expect(server.connectionCount()).toBeGreaterThanOrEqual(2);
+
+    a.destroy();
+    b.destroy();
+    await new Promise((r) => setTimeout(r, 50));
+    // The gauge falls back; the lifetime counter must not.
+    expect(server.acceptedTotal()).toBe(before + 2);
+  });
+
   it('default mode: REQUEST → 2 EVENT_JSON (delta) + DONE', async () => {
     const sock = await connect(socketPath);
     sock.write(
