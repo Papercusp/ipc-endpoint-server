@@ -1,0 +1,27 @@
+{
+  "name": "@papercusp/ipc-endpoint-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Host-agnostic Unix-socket/named-pipe server for the endpoint IPC protocol: framed REQUEST/CANCEL in, EVENT_JSON/EVENT_BIN/DONE/ERROR out, with the privileged sys:http HTTP-over-IPC bridge. Tool resolution, dispatch, and workspace state are injected via an IpcEndpointHost seam \u2014 zero registry or application coupling.",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "@papercusp/ipc-framing": "*",
+    "@papercusp/tooldef": "*"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.4",
+    "zod": "^4.4.3"
+  }
+}
