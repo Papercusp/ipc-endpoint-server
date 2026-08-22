@@ -113,7 +113,7 @@ export type ResolvedEndpoint =
 /** Classify a `socketPath` string into its transport. Exported for tests + the Rust-side guard parity. */
 export function parseEndpoint(socketPath: string): ResolvedEndpoint {
   const trimmed = socketPath.trim();
-  const tcp = /^tcp:\/\/(\[[^\]]+\]|[^/:]+):(\d+)$/.exec(trimmed);
+  const tcp = /^tcp:\/\/(\[[^\]]+\]|[^/:\[\]]+):(\d+)$/.exec(trimmed);
   if (tcp) {
     // Strip [] from a bracketed IPv6 literal for node's listen({ host }).
     const host = tcp[1].startsWith('[') ? tcp[1].slice(1, -1) : tcp[1];

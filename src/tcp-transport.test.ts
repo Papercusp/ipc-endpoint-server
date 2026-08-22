@@ -129,6 +129,22 @@ describe('parseEndpoint', () => {
       port: 8080,
     });
   });
+
+  it('rejects malformed or case-mismatched tcp lookalikes as Unix paths', () => {
+    for (const socketPath of [
+      'TCP://127.0.0.1:35745',
+      'tcp://127.0.0.1',
+      'tcp://127.0.0.1:not-a-port',
+      'tcp://127.0.0.1:35745:1',
+      'tcp://:1',
+      'tcp://[]:1',
+    ]) {
+      expect(parseEndpoint(socketPath), socketPath).toEqual({
+        kind: 'unix',
+        path: socketPath,
+      });
+    }
+  });
 });
 
 describe('startEndpointIpcServer over TCP loopback', () => {
