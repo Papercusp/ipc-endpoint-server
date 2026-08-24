@@ -17,6 +17,7 @@ import {
   lookupByMcpName,
   dispatchProjectedToolStream,
   type ProjectedTool,
+  type UnifiedToolContext,
 } from '@papercusp/tooldef';
 import {
   FrameType,
@@ -36,9 +37,13 @@ import {
 // Because the registry functions wired in here are the same module
 // instance `registerProjectedTool` (below) writes to, dispatch always
 // sees the synthetic tool — no second registry instance is possible.
+let lastDispatchContext: UnifiedToolContext | null = null;
 const host: IpcEndpointHost = {
   lookupByMcpName,
-  dispatchProjectedToolStream,
+  dispatchProjectedToolStream: (tool, toolName, input, ctx, deps) => {
+    lastDispatchContext = ctx;
+    return dispatchProjectedToolStream(tool, toolName, input, ctx, deps);
+  },
   getWorkspaceId: () => 'test-workspace',
 };
 
@@ -170,7 +175,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  // Quiet — no per-test setup needed.
+  lastDispatchContext = null;
 });
 
 describe('startEndpointIpcServer', () => {
@@ -200,6 +205,28 @@ describe('startEndpointIpcServer', () => {
     await new Promise((r) => setTimeout(r, 50));
     // The gauge falls back; the lifetime counter must not.
     expect(server.acceptedTotal()).toBe(before + 2);
+  });
+
+  it('stamps IPC dispatches with a trusted process-internal operator principal', async () => {
+    const sock = await connect(socketPath);
+    sock.write(
+      encodeJsonFrame(FrameType.REQUEST, {
+        id: 11,
+        toolName: SYNTHETIC_TOOL_NAME,
+        input: { text: 'principal' },
+      }),
+    );
+    await readFramesUntil(sock, (f) => f.some((x) => x.type === FrameType.DONE));
+
+    expect(lastDispatchContext?.principal).toMatchObject({
+      kind: 'system',
+      slug: 'system:operator',
+      workspaceId: 'test-workspace',
+      authMethod: 'process-internal',
+      trust: 'trusted',
+    });
+    expect(lastDispatchContext?.principal?.capabilities.has('*')).toBe(true);
+    expect(lastDispatchContext?.principal?.roles?.has('brain')).toBe(true);
   });
 
   it('default mode: REQUEST → 2 EVENT_JSON (delta) + DONE', async () => {

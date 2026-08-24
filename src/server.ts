@@ -478,13 +478,14 @@ function handleConnection(socket: net.Socket, deps: PerConnectionDeps): void {
     // workspaceId comes from the host (matches what the HTTP route's
     // `activeWorkspaceId()` returns) so per-workspace state and RLS
     // resolve correctly.
+    const workspaceId = deps.host.getWorkspaceId();
     const ctx: UnifiedToolContext = {
       log: (m) => deps.logger.info(`[${parsed.toolName}] ${m}`),
       signal: abort.signal,
       progress: () => { /* dispatchProjectedToolStream overrides this */ },
       emit: () => { /* dispatchProjectedToolStream overrides this */ },
       transport: 'ipc',
-      workspaceId: deps.host.getWorkspaceId(),
+      workspaceId,
       role: 'operator',
       // Phase 4 T2.2: UUIDs match the HTTP-side decision (reviewer
       // concern #4 in v1 plan review). The per-connection `id` is
@@ -492,6 +493,17 @@ function handleConnection(socket: net.Socket, deps: PerConnectionDeps): void {
       // one sidecar could conflict on `ipc-1` etc; UUIDs sidestep.
       runId: globalThis.crypto.randomUUID(),
       spawnId: globalThis.crypto.randomUUID(),
+      // The IPC socket is an in-process operator boundary; carry a complete
+      // trusted principal so telemetry does not lose provenance at this seam.
+      principal: {
+        kind: 'system',
+        slug: 'system:operator',
+        workspaceId,
+        authMethod: 'process-internal',
+        trust: 'trusted',
+        capabilities: new Set(['*']),
+        roles: new Set(['brain']),
+      },
     };
 
     const wireKinds = tool.eventWireKinds ?? {};
