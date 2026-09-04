@@ -227,6 +227,7 @@ describe('startEndpointIpcServer', () => {
     });
     expect(lastDispatchContext?.principal?.capabilities.has('*')).toBe(true);
     expect(lastDispatchContext?.principal?.roles?.has('brain')).toBe(true);
+    expect(lastDispatchContext?.interactiveCardCapability).toBe(true);
   });
 
   it('default mode: REQUEST → 2 EVENT_JSON (delta) + DONE', async () => {

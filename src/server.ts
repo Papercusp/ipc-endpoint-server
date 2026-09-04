@@ -487,6 +487,7 @@ function handleConnection(socket: net.Socket, deps: PerConnectionDeps): void {
       transport: 'ipc',
       workspaceId,
       role: 'operator',
+      interactiveCardCapability: true,
       // Phase 4 T2.2: UUIDs match the HTTP-side decision (reviewer
       // concern #4 in v1 plan review). The per-connection `id` is
       // already unique within one socket but multiple webviews to
