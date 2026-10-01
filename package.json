@@ -16,6 +16,9 @@
   "scripts": {
     "test": "vitest run"
   },
+  "dependencies": {
+    "tough-cookie": "^6.0.1"
+  },
   "peerDependencies": {
     "@papercusp/ipc-framing": "*",
     "@papercusp/tooldef": "*"

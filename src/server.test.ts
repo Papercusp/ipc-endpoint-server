@@ -10,6 +10,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
+import http from 'node:http';
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { z } from 'zod';
 import {
@@ -108,6 +109,50 @@ function connect(socketPath: string): Promise<net.Socket> {
 
 let server: EndpointIpcServer;
 let socketPath: string;
+
+describe('sys:http connection-scoped human sessions', () => {
+  it('logs in over IPC and keeps the human cookie isolated from other and reconnected clients', async () => {
+    const upstream = http.createServer((req, res) => {
+      if (req.url === '/login') {
+        res.setHeader('Set-Cookie', 'session=human; Path=/; HttpOnly; SameSite=Lax');
+      } else if (req.headers.cookie !== 'session=human') {
+        res.statusCode = 401;
+      }
+      res.end('{}');
+    });
+    await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve));
+    const port = (upstream.address() as net.AddressInfo).port;
+    const isolatedServer = await startEndpointIpcServer({ host, socketPath: tmpSocketPath('cookies'), upstreamBaseUrl: `http://127.0.0.1:${port}`, logger: { info() {}, warn() {} } });
+    const sockets: net.Socket[] = [];
+    try {
+      const first = await connect(isolatedServer.socketPath);
+      const second = await connect(isolatedServer.socketPath);
+      sockets.push(first, second);
+      const request = async (socket: net.Socket, id: number, path: string, credentials = 'include') => {
+        const reading = readFramesUntil(socket, frames => frames.some(f => f.type === FrameType.DONE || f.type === FrameType.ERROR));
+        socket.write(encodeJsonFrame(FrameType.REQUEST, { id, toolName: 'sys:http', input: { method: 'GET', path, credentials } }));
+        const frames = await reading;
+        const head = frames.find(f => f.type === FrameType.EVENT_JSON && JSON.parse(f.payload.toString()).name === 'head');
+        expect(head).toBeDefined();
+        return JSON.parse(head!.payload.toString()).data;
+      };
+      const login = await request(first, 1, '/login');
+      expect(login.status).toBe(200);
+      expect(login.headers['set-cookie']).toBeUndefined();
+      expect((await request(first, 2, '/human-work')).status).toBe(200);
+      expect((await request(first, 3, '/human-work', 'omit')).status).toBe(401);
+      expect((await request(second, 1, '/human-work')).status).toBe(401);
+      first.destroy();
+      const reconnected = await connect(isolatedServer.socketPath);
+      sockets.push(reconnected);
+      expect((await request(reconnected, 1, '/human-work')).status).toBe(401);
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      await isolatedServer.close();
+      await new Promise<void>((resolve, reject) => upstream.close(err => err ? reject(err) : resolve()));
+    }
+  });
+});
 
 beforeAll(async () => {
   // Register the synthetic tool once per file run.

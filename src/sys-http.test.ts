@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { FrameType, decodeEventBinPayload, type FrameTypeValue } from '@papercusp/ipc-framing';
 import { handleSysHttp, type SysHttpDeps } from './sys-http';
+import { CookieJar } from 'tough-cookie';
 
 interface Captured {
   type: FrameTypeValue;
@@ -13,6 +14,7 @@ function makeDeps(fetchImpl: typeof fetch): { deps: SysHttpDeps; emitted: Captur
   const deps: SysHttpDeps = {
     upstreamBase: 'http://test.local',
     fetchImpl,
+    cookieJar: new CookieJar(),
     writeFrame: (type, payload) => {
       if (type === FrameType.EVENT_BIN) bin.push(payload);
       else emitted.push({ type, payload });
@@ -166,6 +168,103 @@ describe('handleSysHttp — JSON GET (non-SSE)', () => {
     expect(headers['connection']).toBeUndefined();
     expect(headers['keep-alive']).toBeUndefined();
     expect(headers['transfer-encoding']).toBeUndefined();
+  });
+});
+
+describe('handleSysHttp — host-only session cookies', () => {
+  it('retains multiple login cookies, hides them from the webview, and expires logout cookies', async () => {
+    const seen: (string | null)[] = [];
+    const { deps, emitted } = makeDeps(async (url, init) => {
+      seen.push(new Headers(init?.headers).get('cookie'));
+      const headers = new Headers();
+      if (String(url).endsWith('/login')) {
+        headers.append('set-cookie', 'session=human; Path=/; HttpOnly; SameSite=Lax');
+        headers.append('set-cookie', 'workspace=pilot; Path=/; Expires=Wed, 21 Oct 2037 07:28:00 GMT');
+        headers.append('set-cookie', 'foreign=ignored; Domain=other.local; Path=/');
+      } else if (String(url).endsWith('/logout')) {
+        headers.append('set-cookie', 'session=; Path=/; Max-Age=0; HttpOnly');
+      }
+      return new Response('{}', { headers });
+    });
+    const call = (id: bigint, path: string) => handleSysHttp(id, { method: 'GET', path }, new AbortController().signal, deps);
+    await call(1n, '/login');
+    await call(2n, '/human-work');
+    await call(3n, '/logout');
+    await call(4n, '/human-work');
+    expect(seen).toEqual([null, 'session=human; workspace=pilot', 'session=human; workspace=pilot', 'workspace=pilot']);
+    for (const event of emitted.filter(e => e.type === FrameType.EVENT_JSON)) {
+      expect((event.payload as any).data.headers['set-cookie']).toBeUndefined();
+    }
+    expect(JSON.stringify(emitted)).not.toContain('session=human');
+  });
+
+  it.each(['same-origin', 'include'])('honors cookie path, expiry and secure rules with %s', async credentials => {
+    const seen: (string | null)[] = [];
+    const { deps } = makeDeps(async (_url, init) => {
+      seen.push(new Headers(init?.headers).get('cookie'));
+      return jsonResponse({ ok: true });
+    });
+    await deps.cookieJar!.setCookie('scoped=allowed; Path=/human-work; HttpOnly', 'http://test.local');
+    await deps.cookieJar!.setCookie('expired=no; Path=/; Max-Age=0', 'http://test.local');
+    await deps.cookieJar!.setCookie('secure=no; Path=/; Secure', 'https://test.local');
+    for (const path of ['/other', '/human-work/items']) {
+      await handleSysHttp(1n, { method: 'GET', path, credentials }, new AbortController().signal, deps);
+    }
+    expect(seen).toEqual([null, 'scoped=allowed']);
+  });
+
+  it('omit neither sends nor stores cookies, and webview/injected Cookie cannot forge a user session', async () => {
+    const seen: (string | null)[] = [];
+    const { deps, emitted } = makeDeps(async (_url, init) => {
+      seen.push(new Headers(init?.headers).get('cookie'));
+      return new Response('{}', { headers: { 'set-cookie': 'session=replaced; Path=/; HttpOnly' } });
+    });
+    await deps.cookieJar!.setCookie('session=original; Path=/; HttpOnly', 'http://test.local');
+    deps.injectHeaders = () => ({ Cookie: 'injected=forged' });
+    await handleSysHttp(1n, { method: 'GET', path: '/', credentials: 'omit', headers: { Cookie: 'webview=forged' } }, new AbortController().signal, deps);
+    expect(seen).toEqual([null]);
+    expect(await deps.cookieJar!.getCookieString('http://test.local')).toBe('session=original');
+    expect(JSON.stringify(emitted)).not.toContain('session=replaced');
+    await handleSysHttp(2n, { method: 'GET', path: '/', headers: { cookie: 'webview=forged' } }, new AbortController().signal, deps);
+    expect(seen[1]).toBe('session=original');
+  });
+
+  it('rejects invalid credential modes before upstream dispatch', async () => {
+    let calls = 0;
+    const { deps, emitted } = makeDeps(async () => { calls++; return jsonResponse({}); });
+    await handleSysHttp(1n, { method: 'GET', path: '/', credentials: 'invalid' }, new AbortController().signal, deps);
+    expect(calls).toBe(0);
+    expect((emitted[0].payload as any).error.code).toBe('bad_input');
+  });
+
+  it('accepts login cookies before following a same-origin redirect and rewrites POST on 303', async () => {
+    const seen: { url: string; method: string | undefined; body: unknown; cookie: string | null; type: string | null }[] = [];
+    const { deps } = makeDeps(async (url, init) => {
+      const headers = new Headers(init?.headers);
+      seen.push({ url: String(url), method: init?.method, body: init?.body, cookie: headers.get('cookie'), type: headers.get('content-type') });
+      expect(init?.redirect).toBe('manual');
+      return seen.length === 1
+        ? new Response(null, { status: 303, headers: { location: '/human-work', 'set-cookie': 'session=human; Path=/; HttpOnly' } })
+        : jsonResponse({ ok: true });
+    });
+    await handleSysHttp(1n, { method: 'POST', path: '/login', body: '{}', headers: { 'content-type': 'application/json' }, credentials: 'include' }, new AbortController().signal, deps);
+    expect(seen).toEqual([
+      { url: 'http://test.local/login', method: 'POST', body: '{}', cookie: null, type: 'application/json' },
+      { url: 'http://test.local/human-work', method: 'GET', body: undefined, cookie: 'session=human', type: null },
+    ]);
+  });
+
+  it('does not follow cross-origin redirects or leak the host bearer/cookie to another origin', async () => {
+    let calls = 0;
+    const { deps, emitted } = makeDeps(async () => {
+      calls++;
+      return new Response(null, { status: 307, headers: { location: 'http://other.local/steal' } });
+    });
+    deps.injectHeaders = () => ({ authorization: 'Bearer private-host' });
+    await deps.cookieJar!.setCookie('session=human; Path=/', 'http://test.local');
+    await handleSysHttp(1n, { method: 'GET', path: '/' }, new AbortController().signal, deps);
+    expect(calls).toBe(1);
+    expect((emitted[0].payload as any).error).toMatchObject({ code: 'upstream_error', message: expect.stringContaining('cross-origin redirect') });
   });
 });
 
