@@ -44,6 +44,7 @@ import type {
   DispatchStreamEvent,
 } from '@papercusp/tooldef';
 import { handleSysHttp } from './sys-http';
+import { CookieJar } from 'tough-cookie';
 
 /**
  * The host seam — the three operations the IPC server needs from its
@@ -165,9 +166,9 @@ export interface StartEndpointIpcServerOptions {
   logger?: { info: (msg: string) => void; warn: (msg: string) => void };
   /**
    * Headers the host injects into every `sys:http` bridged upstream request.
-   * The webview is in-boundary but its HttpOnly session cookie can't ride the
-   * IPC bridge, so a host that gates `/api/*` on a session supplies the
-   * equivalent trusted credential here (resolved per request for rotation).
+   * User-session cookies are stored separately in a host-side jar scoped
+   * to each IPC connection. These headers provide an additional trusted
+   * host credential where needed (resolved per request for rotation).
    * See `SysHttpDeps.injectHeaders`. The package never reads any credential
    * itself — this stays domain-free.
    */
@@ -330,6 +331,8 @@ interface PerConnectionDeps {
 
 function handleConnection(socket: net.Socket, deps: PerConnectionDeps): void {
   const dec = new FrameDecoder();
+  // No shared or persisted user identity: disconnect discards this jar.
+  const cookieJar = new CookieJar();
   // Per-call AbortControllers, keyed by request id.
   const inFlight = new Map<bigint, AbortController>();
   // Cancel ids that arrived BEFORE their REQUEST. The handler checks
@@ -449,6 +452,7 @@ function handleConnection(socket: net.Socket, deps: PerConnectionDeps): void {
         logger: deps.logger,
         upstreamBase: deps.upstreamBase,
         injectHeaders: deps.sysHttpInjectHeaders,
+        cookieJar,
       })
         .catch((err) =>
           sendError(id, 'sys_http_error', err instanceof Error ? err.message : String(err)),

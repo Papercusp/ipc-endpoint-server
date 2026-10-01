@@ -36,6 +36,7 @@
  */
 
 import { FrameType, encodeEventBinPayload, type FrameTypeValue } from '@papercusp/ipc-framing';
+import type { CookieJar } from 'tough-cookie';
 
 // RFC 7230 hop-by-hop headers + h2 forbidden headers — must not be
 // forwarded across the bridge in either direction.
@@ -62,13 +63,14 @@ export interface SysHttpDeps {
   upstreamBase?: string;
   /** Override fetch for tests. */
   fetchImpl?: typeof fetch;
+  /** Host-only session storage, owned by one IPC connection. */
+  cookieJar?: CookieJar;
   /**
    * Headers the host injects into every bridged upstream request — e.g. an
    * in-boundary auth credential. The webview is in-boundary (same process
-   * tree as the trusted shell), but its HttpOnly session cookie cannot ride
-   * the IPC bridge: JS can neither read it to forward nor honor the
-   * Set-Cookie that comes back. So a host that gates `/api/*` on a session
-   * supplies the equivalent trusted credential here. Resolved per request
+   * tree as the trusted shell). User sessions stay in the connection's
+   * host-side cookie jar; these headers supply a separate host credential
+   * where the application requires one. Resolved per request
    * so the host can return a freshly-read (rotatable) token. Merged OVER the
    * forwarded headers (host wins, so a webview header can't shadow the
    * credential); hop-by-hop names are still dropped. The package itself
@@ -104,11 +106,12 @@ export async function handleSysHttp(
     });
     return;
   }
-  const { method, path, headers: inHeaders, body } = input as {
+  const { method, path, headers: inHeaders, body, credentials = 'same-origin' } = input as {
     method?: unknown;
     path?: unknown;
     headers?: unknown;
     body?: unknown;
+    credentials?: unknown;
   };
   if (typeof method !== 'string' || typeof path !== 'string') {
     writeJson(FrameType.ERROR, {
@@ -127,14 +130,23 @@ export async function handleSysHttp(
     });
     return;
   }
+  if (!['omit', 'same-origin', 'include'].includes(credentials as string)) {
+    writeJson(FrameType.ERROR, {
+      id: Number(id),
+      error: { code: 'bad_input', message: 'sys:http credentials must be omit, same-origin, or include' },
+    });
+    return;
+  }
 
-  const upstreamUrl = resolveUpstreamBase(deps.upstreamBase) + path;
+  const upstreamUrl = new URL(resolveUpstreamBase(deps.upstreamBase) + path);
+  const useCookies = credentials !== 'omit' && !!deps.cookieJar;
 
   const upstreamHeaders: Record<string, string> = {};
   if (inHeaders && typeof inHeaders === 'object') {
     for (const [k, v] of Object.entries(inHeaders as Record<string, unknown>)) {
-      if (typeof v === 'string' && !HOP_BY_HOP.has(k.toLowerCase())) {
-        upstreamHeaders[k] = v;
+      const name = k.toLowerCase();
+      if (typeof v === 'string' && !HOP_BY_HOP.has(name) && name !== 'cookie' && name !== 'cookie2') {
+        upstreamHeaders[name] = v;
       }
     }
   }
@@ -144,20 +156,56 @@ export async function handleSysHttp(
   const injected = deps.injectHeaders?.();
   if (injected) {
     for (const [k, v] of Object.entries(injected)) {
-      if (typeof v === 'string' && !HOP_BY_HOP.has(k.toLowerCase())) {
-        upstreamHeaders[k] = v;
+      const name = k.toLowerCase();
+      if (typeof v === 'string' && !HOP_BY_HOP.has(name) && name !== 'cookie' && name !== 'cookie2') {
+        upstreamHeaders[name] = v;
       }
     }
   }
 
   let res: Response;
   try {
-    res = await fetchImpl(upstreamUrl, {
-      method,
-      headers: upstreamHeaders,
-      body: typeof body === 'string' ? body : undefined,
-      signal,
-    });
+    let url = upstreamUrl;
+    let requestMethod = method.toUpperCase();
+    let requestBody = typeof body === 'string' ? body : undefined;
+    for (let redirects = 0; ; redirects++) {
+      // Cookies are never accepted from webview headers and never cross
+      // origins. Recompute for each redirect's path/expiry/security rules.
+      delete upstreamHeaders.cookie;
+      if (useCookies) {
+        const cookie = await deps.cookieJar!.getCookieString(url.href);
+        if (cookie) upstreamHeaders.cookie = cookie;
+      }
+      signal.throwIfAborted();
+      res = await fetchImpl(url.href, {
+        method: requestMethod,
+        headers: upstreamHeaders,
+        body: requestBody,
+        signal,
+        redirect: 'manual',
+      });
+      if (useCookies) {
+        for (const cookie of res.headers.getSetCookie()) {
+          await deps.cookieJar!.setCookie(cookie, url.href, { ignoreError: true });
+        }
+      }
+      const location = res.headers.get('location');
+      if (![301, 302, 303, 307, 308].includes(res.status) || !location) break;
+      await res.body?.cancel();
+      const nextUrl = new URL(location, url);
+      if (nextUrl.origin !== upstreamUrl.origin) {
+        throw new TypeError('sys:http refuses a cross-origin redirect');
+      }
+      if (redirects >= 20) throw new TypeError('sys:http redirect limit exceeded');
+      if (((res.status === 301 || res.status === 302) && requestMethod === 'POST') ||
+          (res.status === 303 && requestMethod !== 'GET' && requestMethod !== 'HEAD')) {
+        requestMethod = 'GET';
+        requestBody = undefined;
+        delete upstreamHeaders['content-type'];
+        delete upstreamHeaders['content-length'];
+      }
+      url = nextUrl;
+    }
   } catch (err) {
     if (signal.aborted) {
       writeJson(FrameType.ERROR, {
@@ -179,7 +227,10 @@ export async function handleSysHttp(
   const contentType = res.headers.get('content-type') ?? '';
   const responseHeaders: Record<string, string> = {};
   res.headers.forEach((v, k) => {
-    if (!HOP_BY_HOP.has(k.toLowerCase())) responseHeaders[k] = v;
+    const name = k.toLowerCase();
+    // Match browser fetch: Set-Cookie (including HttpOnly values) is a
+    // forbidden response header, consumed only by the trusted host jar.
+    if (!HOP_BY_HOP.has(name) && name !== 'set-cookie' && name !== 'set-cookie2') responseHeaders[k] = v;
   });
 
   writeJson(FrameType.EVENT_JSON, {
