@@ -29,6 +29,7 @@ import {
   type Frame,
 } from '@papercusp/ipc-framing';
 import {
+  IPC_KEEPALIVE_EVENT,
   startEndpointIpcServer,
   type EndpointIpcServer,
   type IpcEndpointHost,
@@ -182,6 +183,12 @@ beforeAll(async () => {
       if (args.mode === 'binary') {
         ctx.emit?.('bin', new Uint8Array([0xde, 0xad, 0xbe, 0xef]));
         return { content: [{ type: 'text', text: 'binary-done' }] };
+      }
+      if (args.mode === 'quiet') {
+        // Work that emits nothing for a while (a long query, a clone).
+        const waitMs = (input as { waitMs?: number }).waitMs ?? 300;
+        await new Promise((r) => setTimeout(r, waitMs));
+        return { content: [{ type: 'text', text: 'quiet-done' }] };
       }
       if (args.mode === 'slow') {
         // Emit several deltas with pauses so we can test cancellation.
@@ -508,6 +515,151 @@ describe('startEndpointIpcServer', () => {
     await new Promise<void>((resolve) => sock.once('close', () => resolve()));
     // Test passes when the close event fires.
     expect(sock.destroyed).toBe(true);
+  });
+});
+
+describe('keepalive for calls still in flight (WI-6554700010008458)', () => {
+  type Received = { at: number; type: number; body: { id?: number; name?: string; data?: unknown } };
+
+  /** Send one REQUEST and record every frame for it, timestamped from the send, until its terminal. */
+  async function runCall(
+    target: string,
+    request: { id: number; toolName: string; input: unknown },
+    timeoutMs = 5_000,
+  ): Promise<Received[]> {
+    const sock = await connect(target);
+    try {
+      const started = Date.now();
+      const received: Received[] = [];
+      const dec = new FrameDecoder();
+      const done = new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(
+          () =>
+            reject(
+              new Error(
+                `no terminal after ${timeoutMs}ms; got ${received.length} frames: ${received
+                  .map((f) => `${f.at}ms:0x${f.type.toString(16)}:${f.body.name ?? ''}`)
+                  .join(' ')}`,
+              ),
+            ),
+          timeoutMs,
+        );
+        sock.on('data', (chunk: Buffer) => {
+          dec.push(chunk);
+          for (const f of dec.drain()) {
+            // EVENT_BIN payloads are binary (a sys:http response body); the rest are JSON.
+            const body = f.type === FrameType.EVENT_BIN ? { name: decodeEventBinPayload(f.payload).name } : JSON.parse(f.payload.toString());
+            received.push({ at: Date.now() - started, type: f.type, body });
+            if (f.type === FrameType.DONE || f.type === FrameType.ERROR) {
+              clearTimeout(timer);
+              resolve();
+            }
+          }
+        });
+      });
+      sock.write(encodeJsonFrame(FrameType.REQUEST, request));
+      await done;
+      // Anything the server still sends for the finished call would land here.
+      await new Promise((r) => setTimeout(r, 200));
+      return received;
+    } finally {
+      sock.destroy();
+    }
+  }
+
+  const isKeepalive = (f: Received) => f.type === FrameType.EVENT_JSON && f.body.name === IPC_KEEPALIVE_EVENT;
+  const terminalIndex = (frames: Received[]) => frames.findIndex((f) => f.type === FrameType.DONE || f.type === FrameType.ERROR);
+
+  it('keeps a sys:http call alive while its upstream route is slow to answer, and stops at the terminal', async () => {
+    // The observed failure: POST /api/cupboard/install-plugin clones and describes a package before
+    // answering, sending nothing; the desktop client's 20s idle watchdog then killed the call.
+    const upstream = http.createServer((_req, res) => {
+      setTimeout(() => res.end('{"ok":true}'), 400);
+    });
+    await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+    const port = (upstream.address() as net.AddressInfo).port;
+    const slowServer = await startEndpointIpcServer({
+      host,
+      socketPath: tmpSocketPath('keepalive-http'),
+      upstreamBaseUrl: `http://127.0.0.1:${port}`,
+      keepaliveIntervalMs: 50,
+      logger: { info() {}, warn() {} },
+    });
+    try {
+      const frames = await runCall(slowServer.socketPath, { id: 7, toolName: 'sys:http', input: { method: 'POST', path: '/install' } });
+      const end = terminalIndex(frames);
+      expect(end).toBeGreaterThan(0);
+      const headAt = frames.findIndex((f) => f.body.name === 'head');
+      const beats = frames.filter(isKeepalive);
+      // Liveness flowed during the silence before the response head…
+      expect(frames.slice(0, headAt).filter(isKeepalive).length).toBeGreaterThanOrEqual(3);
+      for (const beat of beats) expect(beat.body).toEqual({ id: 7, name: IPC_KEEPALIVE_EVENT, data: null });
+      // …and none after the call ended.
+      expect(frames.slice(end + 1)).toEqual([]);
+      expect(frames[end]!.type).toBe(FrameType.DONE);
+    } finally {
+      await slowServer.close();
+      await new Promise<void>((resolve, reject) => upstream.close((err) => (err ? reject(err) : resolve())));
+    }
+  });
+
+  it('keeps a quiet tool call alive, and the result is unchanged', async () => {
+    const quietServer = await startEndpointIpcServer({
+      host,
+      socketPath: tmpSocketPath('keepalive-tool'),
+      allowedTools: [SYNTHETIC_TOOL_NAME],
+      keepaliveIntervalMs: 50,
+      logger: { info() {}, warn() {} },
+    });
+    try {
+      const frames = await runCall(quietServer.socketPath, { id: 3, toolName: SYNTHETIC_TOOL_NAME, input: { mode: 'quiet', waitMs: 400 } });
+      const end = terminalIndex(frames);
+      expect(frames.slice(0, end).every(isKeepalive)).toBe(true);
+      expect(end).toBeGreaterThanOrEqual(3);
+      expect(frames[end]!.body).toMatchObject({ id: 3, result: { content: [{ type: 'text', text: 'quiet-done' }] } });
+      expect(frames.slice(end + 1)).toEqual([]);
+    } finally {
+      await quietServer.close();
+    }
+  });
+
+  it('stops keeping a call alive after the span, so a call that hangs still ends at the client', async () => {
+    const boundedServer = await startEndpointIpcServer({
+      host,
+      socketPath: tmpSocketPath('keepalive-span'),
+      allowedTools: [SYNTHETIC_TOOL_NAME],
+      keepaliveIntervalMs: 50,
+      keepaliveMaxMs: 200,
+      logger: { info() {}, warn() {} },
+    });
+    try {
+      const frames = await runCall(boundedServer.socketPath, { id: 4, toolName: SYNTHETIC_TOOL_NAME, input: { mode: 'quiet', waitMs: 1_200 } });
+      const beats = frames.filter(isKeepalive);
+      expect(beats.length).toBeGreaterThanOrEqual(1);
+      // Beats are only sent while the call is younger than the span; the last one lands well before the result.
+      const done = frames[terminalIndex(frames)]!;
+      expect(done.type).toBe(FrameType.DONE);
+      expect(Math.max(...beats.map((b) => b.at))).toBeLessThan(done.at - 400);
+    } finally {
+      await boundedServer.close();
+    }
+  });
+
+  it('sends no keepalive when disabled', async () => {
+    const plainServer = await startEndpointIpcServer({
+      host,
+      socketPath: tmpSocketPath('keepalive-off'),
+      allowedTools: [SYNTHETIC_TOOL_NAME],
+      keepaliveIntervalMs: 0,
+      logger: { info() {}, warn() {} },
+    });
+    try {
+      const frames = await runCall(plainServer.socketPath, { id: 5, toolName: SYNTHETIC_TOOL_NAME, input: { mode: 'quiet', waitMs: 300 } });
+      expect(frames.filter(isKeepalive)).toEqual([]);
+      expect(frames.map((f) => f.type)).toEqual([FrameType.DONE]);
+    } finally {
+      await plainServer.close();
+    }
   });
 });
 

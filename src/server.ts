@@ -47,6 +47,26 @@ import { handleSysHttp } from './sys-http';
 import { CookieJar } from 'tough-cookie';
 
 /**
+ * Name of the liveness EVENT_JSON the server sends for every call still in
+ * flight (PROTOCOL.md § Keepalive). A client's per-call idle watchdog cannot
+ * otherwise tell a slow-but-live call (a route that clones a repo, a tool that
+ * waits on a long query) from a wedged peer: nothing is sent until the handler
+ * yields. The beat comes from this process's own event loop, so a sidecar that
+ * is blocked, or that accepted the socket but is not servicing it, still sends
+ * nothing and the client's watchdog keeps its purpose. Clients treat it as
+ * activity only; it is never part of a call's result.
+ */
+export const IPC_KEEPALIVE_EVENT = 'ipc.keepalive';
+/** Default keepalive cadence; well under the desktop client's 20s call budget. */
+export const DEFAULT_IPC_KEEPALIVE_INTERVAL_MS = 5_000;
+/**
+ * Default span after which a call stops being kept alive. A request that hangs
+ * forever must still end: past this span the client's idle watchdog applies
+ * again. Streams that outlive it carry their own heartbeats (SSE).
+ */
+export const DEFAULT_IPC_KEEPALIVE_MAX_MS = 15 * 60_000;
+
+/**
  * The host seam — the three operations the IPC server needs from its
  * embedding application, injected so this package stays free of any
  * concrete tool-registry / workspace-state dependency.
@@ -173,6 +193,13 @@ export interface StartEndpointIpcServerOptions {
    * itself — this stays domain-free.
    */
   sysHttpInjectHeaders?: () => Record<string, string> | undefined;
+  /**
+   * Cadence of the `ipc.keepalive` frame sent for each in-flight call.
+   * Default `DEFAULT_IPC_KEEPALIVE_INTERVAL_MS`; `0` disables keepalives.
+   */
+  keepaliveIntervalMs?: number;
+  /** Stop keeping a call alive after this long. Default `DEFAULT_IPC_KEEPALIVE_MAX_MS`. */
+  keepaliveMaxMs?: number;
 }
 
 export interface EndpointIpcServer {
@@ -254,7 +281,16 @@ export async function startEndpointIpcServer(
   const server = net.createServer((socket) => {
     connections.add(socket);
     acceptedTotal += 1;
-    handleConnection(socket, { allowed, deps, logger, host, upstreamBase, sysHttpInjectHeaders });
+    handleConnection(socket, {
+      allowed,
+      deps,
+      logger,
+      host,
+      upstreamBase,
+      sysHttpInjectHeaders,
+      keepaliveIntervalMs: options.keepaliveIntervalMs ?? DEFAULT_IPC_KEEPALIVE_INTERVAL_MS,
+      keepaliveMaxMs: options.keepaliveMaxMs ?? DEFAULT_IPC_KEEPALIVE_MAX_MS,
+    });
     socket.on('close', () => {
       connections.delete(socket);
     });
@@ -327,14 +363,48 @@ interface PerConnectionDeps {
   upstreamBase?: string;
   /** Host credential injected into sys:http upstream requests; see options. */
   sysHttpInjectHeaders?: () => Record<string, string> | undefined;
+  /** `ipc.keepalive` cadence; 0 disables. */
+  keepaliveIntervalMs: number;
+  /** Per-call keepalive span. */
+  keepaliveMaxMs: number;
 }
 
 function handleConnection(socket: net.Socket, deps: PerConnectionDeps): void {
   const dec = new FrameDecoder();
   // No shared or persisted user identity: disconnect discards this jar.
   const cookieJar = new CookieJar();
-  // Per-call AbortControllers, keyed by request id.
+  // Per-call AbortControllers, keyed by request id. The Map is the in-flight
+  // set: a call enters it before its handler starts and leaves it at its terminal.
   const inFlight = new Map<bigint, AbortController>();
+  // When each in-flight call started, for the keepalive span.
+  const startedAt = new Map<bigint, number>();
+  // One keepalive timer per connection, armed only while a call is in flight.
+  // A setTimeout chain (not an interval) so an idle connection holds no timer.
+  let keepaliveTimer: NodeJS.Timeout | null = null;
+  const beat = (): void => {
+    keepaliveTimer = null;
+    if (socket.destroyed) return;
+    const now = Date.now();
+    for (const id of inFlight.keys()) {
+      if (now - (startedAt.get(id) ?? now) >= deps.keepaliveMaxMs) continue;
+      writeJson(FrameType.EVENT_JSON, { id: Number(id), name: IPC_KEEPALIVE_EVENT, data: null });
+    }
+    armKeepalive();
+  };
+  const armKeepalive = (): void => {
+    if (keepaliveTimer || deps.keepaliveIntervalMs <= 0 || inFlight.size === 0) return;
+    keepaliveTimer = setTimeout(beat, deps.keepaliveIntervalMs);
+    keepaliveTimer.unref?.();
+  };
+  const track = (id: bigint, abort: AbortController): void => {
+    inFlight.set(id, abort);
+    startedAt.set(id, Date.now());
+    armKeepalive();
+  };
+  const untrack = (id: bigint): void => {
+    inFlight.delete(id);
+    startedAt.delete(id);
+  };
   // Cancel ids that arrived BEFORE their REQUEST. The handler checks
   // this set on registration and pre-aborts the new controller. Without
   // this, a CANCEL frame that races ahead of its REQUEST (possible on
@@ -384,6 +454,9 @@ function handleConnection(socket: net.Socket, deps: PerConnectionDeps): void {
   socket.on('close', () => {
     for (const ac of inFlight.values()) ac.abort();
     inFlight.clear();
+    startedAt.clear();
+    if (keepaliveTimer) clearTimeout(keepaliveTimer);
+    keepaliveTimer = null;
   });
 
   socket.on('error', (err) => {
@@ -444,7 +517,7 @@ function handleConnection(socket: net.Socket, deps: PerConnectionDeps): void {
     // uniform gating + telemetry intent.
     if (parsed.toolName === 'sys:http') {
       const abort = new AbortController();
-      inFlight.set(id, abort);
+      track(id, abort);
       if (preCancelledIds.delete(id)) abort.abort();
       void handleSysHttp(id, parsed.input, abort.signal, {
         writeFrame,
@@ -458,7 +531,7 @@ function handleConnection(socket: net.Socket, deps: PerConnectionDeps): void {
           sendError(id, 'sys_http_error', err instanceof Error ? err.message : String(err)),
         )
         .finally(() => {
-          inFlight.delete(id);
+          untrack(id);
         });
       return;
     }
@@ -470,7 +543,7 @@ function handleConnection(socket: net.Socket, deps: PerConnectionDeps): void {
     }
 
     const abort = new AbortController();
-    inFlight.set(id, abort);
+    track(id, abort);
     // Race: a CANCEL frame for this id may have arrived BEFORE the
     // REQUEST (pipelined writes). Pre-abort if so.
     if (preCancelledIds.delete(id)) {
@@ -551,7 +624,7 @@ function handleConnection(socket: net.Socket, deps: PerConnectionDeps): void {
         err instanceof Error ? err.message : String(err),
       );
     } finally {
-      inFlight.delete(id);
+      untrack(id);
     }
   }
 

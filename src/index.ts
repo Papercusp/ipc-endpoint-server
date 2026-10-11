@@ -15,6 +15,9 @@
 export {
   startEndpointIpcServer,
   defaultSocketPath,
+  IPC_KEEPALIVE_EVENT,
+  DEFAULT_IPC_KEEPALIVE_INTERVAL_MS,
+  DEFAULT_IPC_KEEPALIVE_MAX_MS,
   type IpcEndpointHost,
   type StartEndpointIpcServerOptions,
   type EndpointIpcServer,
